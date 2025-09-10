@@ -20,7 +20,7 @@
   @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
   public final class SyncEngine: Observable, Sendable {
     package let userDatabase: UserDatabase
-    package let logger: Logger
+    package let logger: any SyncEngineLogger
     package let metadatabase: any DatabaseWriter
     package let tables: [any PrimaryKeyedTable.Type]
     package let privateTables: [any PrimaryKeyedTable.Type]
@@ -73,8 +73,8 @@
     ///   - defaultZone: The zone for all records to be stored in.
     ///   - startImmediately: Determines if the sync engine starts right away or requires an
     ///   explicit call to ``stop()``. By default this argument is `true`.
-    ///   - logger: The logger used to log events in the sync engine. By default a `.disabled`
-    ///   logger is used, which means logs are not printed.
+    ///   - logger: The logger used to log events in the sync engine. By default an Apple Logger
+    ///   is used in production and a disabled logger in tests.
     public convenience init<each T1: PrimaryKeyedTable, each T2: PrimaryKeyedTable>(
       for database: any DatabaseWriter,
       tables: repeat (each T1).Type,
@@ -82,8 +82,8 @@
       containerIdentifier: String? = nil,
       defaultZone: CKRecordZone = CKRecordZone(zoneName: "co.pointfree.SQLiteData.defaultZone"),
       startImmediately: Bool = DependencyValues._current.context == .live,
-      logger: Logger = isTesting
-        ? Logger(.disabled) : Logger(subsystem: "SQLiteData", category: "CloudKit")
+      logger: any SyncEngineLogger = isTesting
+        ? AppleLoggerAdapter.disabled : AppleLoggerAdapter(subsystem: "SQLiteData", category: "CloudKit")
     ) throws
     where
       repeat (each T1).PrimaryKey.QueryOutput: IdentifierStringConvertible,
@@ -200,7 +200,7 @@
           SyncEngine
         ) -> (private: any SyncEngineProtocol, shared: any SyncEngineProtocol),
       userDatabase: UserDatabase,
-      logger: Logger,
+      logger: any SyncEngineLogger,
       tables: [any PrimaryKeyedTable.Type],
       privateTables: [any PrimaryKeyedTable.Type] = []
     ) throws {
@@ -724,7 +724,8 @@
     }
 
     package func handleEvent(_ event: Event, syncEngine: any SyncEngineProtocol) async {
-      logger.log(event, syncEngine: syncEngine)
+      let logData = event.toLogData(databaseScope: syncEngine.database.databaseScope.label)
+      logger.log(logData)
 
       switch event {
       case .accountChange(let changeType):

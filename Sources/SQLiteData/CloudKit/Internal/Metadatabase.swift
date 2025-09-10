@@ -4,7 +4,7 @@
 
   @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
   func defaultMetadatabase(
-    logger: Logger,
+    logger: any SyncEngineLogger,
     url: URL
   ) throws -> any DatabaseWriter {
     var configuration = Configuration()
