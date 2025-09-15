@@ -356,11 +356,28 @@
     /// You must start the sync engine again using ``start()`` to synchronize the changes.
     public func stop() {
       guard isRunning else { return }
+      
+      logger.debug(
+        """
+        SyncEngine: stop
+          🛑 Stopping sync engine
+          Private sync: \(syncEngines.withValue { $0.private != nil ? "active" : "inactive" })
+          Shared sync: \(syncEngines.withValue { $0.shared != nil ? "active" : "inactive" })
+        """
+      )
+      
       observationRegistrar.withMutation(of: self, keyPath: \.isRunning) {
         syncEngines.withValue {
           $0 = SyncEngines()
         }
       }
+      
+      logger.debug(
+        """
+        SyncEngine: stop completed
+          ✅ Sync engine stopped successfully
+        """
+      )
     }
 
     /// Determines if the sync engine is currently running or not.
@@ -372,7 +389,26 @@
     }
 
     private func start() throws -> Task<Void, Never> {
-      guard !isRunning else { return Task {} }
+      guard !isRunning else {
+        logger.debug(
+          """
+          SyncEngine: start
+            ⚠️ Sync engine already running, skipping start
+          """
+        )
+        return Task {}
+      }
+      
+      let startTime = Date()
+      logger.debug(
+        """
+        SyncEngine: start
+          🚀 Starting sync engine
+          Tables: \(tables.map { $0.tableName }.joined(separator: ", "))
+          Private tables: \(privateTables.map { $0.tableName }.joined(separator: ", "))
+        """
+      )
+      
       observationRegistrar.withMutation(of: self, keyPath: \.isRunning) {
         syncEngines.withValue {
           let (privateSyncEngine, sharedSyncEngine) = defaultSyncEngines(metadatabase, self)
@@ -432,7 +468,17 @@
       return Task {
         await withErrorReporting(.sqliteDataCloudKitFailure) {
           guard try await container.accountStatus() == .available
-          else { return }
+          else {
+            logger.warning(
+              """
+              SyncEngine: start
+                ⚠️ CloudKit account not available, sync disabled
+              """
+            )
+            return
+          }
+          
+          let schemaCheckStart = Date()
           try await uploadRecordsToCloudKit(
             previousRecordTypeByTableName: previousRecordTypeByTableName,
             currentRecordTypeByTableName: currentRecordTypeByTableName
@@ -442,6 +488,20 @@
             currentRecordTypeByTableName: currentRecordTypeByTableName
           )
           try await cacheUserTables(recordTypes: currentRecordTypes)
+          
+          let totalTime = Date().timeIntervalSince(startTime)
+          let schemaTime = Date().timeIntervalSince(schemaCheckStart)
+          
+          logger.debug(
+            """
+            SyncEngine: start completed
+              ✅ Sync engine started successfully
+              Total time: \(String(format: "%.2f", totalTime))s
+              Schema sync time: \(String(format: "%.2f", schemaTime))s
+              Previous tables: \(previousRecordTypes.count)
+              Current tables: \(currentRecordTypes.count)
+            """
+          )
         }
       }
     }
@@ -576,6 +636,14 @@
     }
 
     func deleteLocalData() async throws {
+      logger.warning(
+        """
+        deleteLocalData: mass deletion initiated
+          🚨 Deleting ALL local data (account change or reset)
+          Tables to clear: \(tables.map { $0.tableName }.joined(separator: ", "))
+        """
+      )
+      
       stop()
       try tearDownSyncEngine()
       await withErrorReporting(.sqliteDataCloudKitFailure) {
@@ -583,6 +651,15 @@
           for table in tables {
             func open<T: PrimaryKeyedTable>(_: T.Type) {
               withErrorReporting(.sqliteDataCloudKitFailure) {
+                let count = try T.fetchCount(db)
+                if count > 0 {
+                  logger.debug(
+                    """
+                    deleteLocalData: clearing table
+                      Deleting \(count) record(s) from: \(T.databaseTableName)
+                    """
+                  )
+                }
                 try T.delete().execute(db)
               }
             }
@@ -591,6 +668,14 @@
           try setUpSyncEngine(writableDB: db)
         }
       }
+      
+      logger.debug(
+        """
+        deleteLocalData: mass deletion completed
+          ✅ All local data cleared, restarting sync engine
+        """
+      )
+      
       try await start()
     }
 
@@ -880,11 +965,28 @@
           )
             ?? nil
         else {
+          logger.debug(
+            """
+            [\(syncEngine.database.databaseScope.label)] nextRecordZoneChangeBatch: missing metadata
+              ⚠️ Removing from sync queue - no metadata found
+              Record: \(recordID.recordName)
+              Action: Record will not be synced (metadata missing)
+            """
+          )
           syncEngine.state.remove(pendingRecordZoneChanges: [.saveRecord(recordID)])
           return nil
         }
         guard let table = tablesByName[metadata.recordType]
         else {
+          logger.warning(
+            """
+            [\(syncEngine.database.databaseScope.label)] nextRecordZoneChangeBatch: missing table
+              ⚠️ Removing from sync queue - table not found
+              Record: \(recordID.recordName)
+              Table: \(metadata.recordType)
+              Action: Record will not be synced (table no longer exists)
+            """
+          )
           syncEngine.state.remove(pendingRecordZoneChanges: [.saveRecord(recordID)])
           missingTable = recordID
           return nil
@@ -903,6 +1005,16 @@
             ?? nil
           guard let row
           else {
+            logger.debug(
+              """
+              [\(syncEngine.database.databaseScope.label)] nextRecordZoneChangeBatch: missing local record
+                ⚠️ Removing from sync queue - local record not found
+                Record: \(recordID.recordName)
+                Table: \(metadata.recordType)
+                Primary key: \(metadata.recordPrimaryKey)
+                Action: Record will not be synced (deleted locally)
+              """
+            )
             syncEngine.state.remove(pendingRecordZoneChanges: [.saveRecord(recordID)])
             missingRecord = recordID
             return nil
@@ -1054,6 +1166,13 @@
           try await enqueueUnknownRecordsForCloudKit()
         }
       case .signOut, .switchAccounts:
+        logger.warning(
+          """
+          [\(syncEngine.database.databaseScope.label)] handleAccountChange
+            🔄 Account change detected: \(changeType == .signOut ? "Sign Out" : "Switch Accounts")
+            Action: Deleting all local data to prepare for new account
+          """
+        )
         await withErrorReporting(.sqliteDataCloudKitFailure) {
           try await deleteLocalData()
         }
@@ -1117,11 +1236,33 @@
             .fetchAll(db)
             .compactMap { $0?.recordID.zoneID == zoneID ? $0?.recordType : nil }
         )
+        
+        if !recordTypes.isEmpty {
+          logger.warning(
+            """
+            [\(syncEngine.database.databaseScope.label)] handleFetchedDatabaseChanges: zone deletion
+              🗑️ Deleting ALL records in zone due to server zone deletion
+              Zone: \(zoneID.zoneName):\(zoneID.ownerName)
+              Affected tables: \(recordTypes.joined(separator: ", "))
+              Action: Removing all records from affected tables
+            """
+          )
+        }
+        
         for recordType in recordTypes {
           guard let table = tablesByName[recordType]
           else { continue }
           func open<T: PrimaryKeyedTable>(_: T.Type) {
             withErrorReporting(.sqliteDataCloudKitFailure) {
+              let deletedCount = try T.fetchCount(db)
+              if deletedCount > 0 {
+                logger.debug(
+                  """
+                  [\(syncEngine.database.databaseScope.label)] zone deletion progress
+                    Deleting \(deletedCount) record(s) from table: \(recordType)
+                  """
+                )
+              }
               try T.delete().execute(db)
             }
           }
@@ -1175,6 +1316,16 @@
       for (recordType, recordIDs) in deletedRecordIDsByRecordType {
         let recordPrimaryKeys = recordIDs.compactMap(\.recordPrimaryKey)
         if let table = tablesByName[recordType] {
+          let recordNames = recordIDs.map(\.recordName)
+          logger.debug(
+            """
+            [\(syncEngine.database.databaseScope.label)] handleFetchedRecordZoneChanges: server-initiated deletion
+              🗑️ Deleting \(recordIDs.count) record(s) from \(recordType) as requested by server
+              Records: \(recordNames.prefix(5).joined(separator: ", "))\(recordIDs.count > 5 ? " and \(recordIDs.count - 5) more" : "")
+              Action: Removing from local database
+            """
+          )
+          
           func open<T: PrimaryKeyedTable>(_: T.Type) {
             withErrorReporting(.sqliteDataCloudKitFailure) {
               try userDatabase.write { db in
@@ -1196,13 +1347,27 @@
           }
           open(table)
         } else if recordType == CKRecord.SystemType.share {
+          logger.debug(
+            """
+            [\(syncEngine.database.databaseScope.label)] handleFetchedRecordZoneChanges: share deletion
+              🔒 Deleting \(recordIDs.count) share(s) as requested by server
+              Shares: \(recordIDs.map(\.recordName).prefix(3).joined(separator: ", "))\(recordIDs.count > 3 ? " and \(recordIDs.count - 3) more" : "")
+            """
+          )
           for recordID in recordIDs {
             await withErrorReporting(.sqliteDataCloudKitFailure) {
               try await deleteShare(recordID: recordID)
             }
           }
         } else {
-          // NB: Deleting a record from a table we do not currently recognize.
+          logger.warning(
+            """
+            [\(syncEngine.database.databaseScope.label)] handleFetchedRecordZoneChanges: unknown table deletion
+              ⚠️ Server requested deletion from unknown table: \(recordType)
+              Records: \(recordIDs.map(\.recordName).joined(separator: ", "))
+              Action: Ignoring (table not recognized locally)
+            """
+          )
         }
       }
 
@@ -1233,6 +1398,13 @@
             case .success(let record):
               unsyncedRecords.append(record)
             case .failure(let error as CKError) where error.code == .unknownItem:
+              logger.debug(
+                """
+                handleFetchedRecordZoneChanges: unknownItem
+                  ℹ️ Unsynced record no longer exists on server: \(recordID.recordName)
+                  Action: Removing from unsynced records list
+                """
+              )
               try await userDatabase.write { db in
                 try UnsyncedRecordID.find(recordID).delete().execute(db)
               }
@@ -1310,6 +1482,8 @@
         syncEngine.state.add(pendingRecordZoneChanges: newPendingRecordZoneChanges)
       }
       for (failedRecord, error) in failedRecordSaves {
+        let prefix = "[\(syncEngine.database.databaseScope.label)] handleSentRecordZoneChanges:"
+        
         func clearServerRecord() async {
           await withErrorReporting(.sqliteDataCloudKitFailure) {
             try await userDatabase.write { db in
@@ -1323,21 +1497,62 @@
 
         switch error.code {
         case .serverRecordChanged:
-          guard let serverRecord = error.serverRecord else { continue }
+          guard let serverRecord = error.serverRecord else {
+            logger.warning(
+              """
+              \(prefix) serverRecordChanged
+                ⚠️ No server record provided for conflict resolution
+                Record: \(failedRecord.recordID.recordName)
+              """
+            )
+            continue
+          }
+          logger.debug(
+            """
+            \(prefix) serverRecordChanged
+              🔄 Resolving conflict for: \(failedRecord.recordID.recordName)
+              Type: \(failedRecord.recordType)
+              Action: Merging server record and re-enqueueing
+            """
+          )
           await upsertFromServerRecord(serverRecord)
           newPendingRecordZoneChanges.append(.saveRecord(failedRecord.recordID))
 
         case .zoneNotFound:
           let zone = CKRecordZone(zoneID: failedRecord.recordID.zoneID)
+          logger.debug(
+            """
+            \(prefix) zoneNotFound
+              ⚠️ Zone missing for record: \(failedRecord.recordID.recordName)
+              Zone: \(zone.zoneID.zoneName):\(zone.zoneID.ownerName)
+              Action: Creating zone and re-enqueueing record
+            """
+          )
           newPendingDatabaseChanges.append(.saveZone(zone))
           newPendingRecordZoneChanges.append(.saveRecord(failedRecord.recordID))
           await clearServerRecord()
 
         case .unknownItem:
+          logger.debug(
+            """
+            \(prefix) unknownItem
+              ⚠️ Record doesn't exist on server: \(failedRecord.recordID.recordName)
+              Type: \(failedRecord.recordType)
+              Action: Clearing server record cache and re-enqueueing
+            """
+          )
           newPendingRecordZoneChanges.append(.saveRecord(failedRecord.recordID))
           await clearServerRecord()
 
         case .serverRejectedRequest:
+          logger.warning(
+            """
+            \(prefix) serverRejectedRequest
+              🛑 Server rejected record: \(failedRecord.recordID.recordName)
+              Type: \(failedRecord.recordType)
+              Action: Clearing server record cache (record will not be retried)
+            """
+          )
           await clearServerRecord()
 
         case .referenceViolation:
@@ -1346,7 +1561,26 @@
             let table = tablesByName[failedRecord.recordType],
             foreignKeysByTableName[table.tableName]?.count == 1,
             let foreignKey = foreignKeysByTableName[table.tableName]?.first
-          else { continue }
+          else {
+            logger.warning(
+              """
+              \(prefix) referenceViolation
+                ⚠️ Unable to resolve reference violation for: \(failedRecord.recordID.recordName)
+                Type: \(failedRecord.recordType)
+                Missing: \(failedRecord.recordID.recordPrimaryKey == nil ? "primary key" : "foreign key info")
+              """
+            )
+            continue
+          }
+          logger.debug(
+            """
+            \(prefix) referenceViolation
+              🔗 Handling reference violation for: \(failedRecord.recordID.recordName)
+              Type: \(failedRecord.recordType)
+              Foreign key: \(foreignKey.from) -> \(foreignKey.to)
+              Action: \(foreignKey.onDelete)
+            """
+          )
           func open<T: PrimaryKeyedTable>(_: T.Type) async throws {
             try await userDatabase.write { db in
               try $_isSynchronizingChanges.withValue(false) {
@@ -1402,7 +1636,25 @@
           guard
             let recordPrimaryKey = failedRecord.recordID.recordPrimaryKey,
             let table = tablesByName[failedRecord.recordType]
-          else { continue }
+          else {
+            logger.warning(
+              """
+              \(prefix) permissionFailure
+                ⚠️ Unable to handle permission failure for: \(failedRecord.recordID.recordName)
+                Type: \(failedRecord.recordType)
+                Missing: \(failedRecord.recordID.recordPrimaryKey == nil ? "primary key" : "table info")
+              """
+            )
+            continue
+          }
+          logger.debug(
+            """
+            \(prefix) permissionFailure
+              🔒 Permission denied for: \(failedRecord.recordID.recordName)
+              Type: \(failedRecord.recordType)
+              Action: Attempting to fetch from shared database or delete locally
+            """
+          )
           func open<T: PrimaryKeyedTable>(_: T.Type) async throws {
             do {
               let serverRecord = try await container.sharedCloudDatabase.record(
@@ -1410,6 +1662,13 @@
               )
               await upsertFromServerRecord(serverRecord, force: true)
             } catch let error as CKError where error.code == .unknownItem {
+              logger.debug(
+                """
+                \(prefix) permissionFailure resolution
+                  ✅ Record not found in shared database: \(failedRecord.recordID.recordName)
+                  Action: Deleting local record
+                """
+              )
               try await userDatabase.write { db in
                 try T
                   .where { #sql("\($0.primaryKey) = \(bind: recordPrimaryKey)") }
@@ -1430,8 +1689,17 @@
           .badDatabase, .quotaExceeded, .limitExceeded, .userDeletedZone, .tooManyParticipants,
           .alreadyShared, .managedAccountRestricted, .participantMayNeedVerification,
           .serverResponseLost, .assetNotAvailable, .accountTemporarilyUnavailable:
+          // These errors are typically transient and will be retried automatically
           continue
         @unknown default:
+          logger.warning(
+            """
+            \(prefix) unknown error
+              ⚠️ Unknown error code for: \(failedRecord.recordID.recordName)
+              Type: \(failedRecord.recordType)
+              Error: \(error)
+            """
+          )
           continue
         }
       }
@@ -1441,9 +1709,31 @@
           try await userDatabase.write { db in
             var enqueuedUnsyncedRecordID = false
             for (failedRecordID, error) in failedRecordDeletes {
+              let prefix = "[\(syncEngine.database.databaseScope.label)] handleSentRecordZoneChanges:"
+              
               guard
                 error.code == .referenceViolation
-              else { continue }
+              else {
+                if error.code != .unknownItem {
+                  logger.debug(
+                    """
+                    \(prefix) deleteRecord failed
+                      ⚠️ Failed to delete: \(failedRecordID.recordName)
+                      Error: \(error.code)
+                      Action: Skipping (not a reference violation)
+                    """
+                  )
+                }
+                continue
+              }
+              
+              logger.debug(
+                """
+                \(prefix) deleteRecord referenceViolation
+                  🔗 Cannot delete due to references: \(failedRecordID.recordName)
+                  Action: Adding to unsynced records for later deletion
+                """
+              )
               try UnsyncedRecordID.insert(or: .ignore) {
                 UnsyncedRecordID(recordID: failedRecordID)
               }
@@ -1497,7 +1787,28 @@
         guard let table = tablesByName[serverRecord.recordType]
         else {
           guard let recordPrimaryKey = serverRecord.recordID.recordPrimaryKey
-          else { return }
+          else {
+            logger.warning(
+              """
+              upsertFromServerRecord: unknown record type
+                ⚠️ Skipping record with unknown type and no primary key
+                Record: \(serverRecord.recordID.recordName)
+                Type: \(serverRecord.recordType)
+              """
+            )
+            return
+          }
+          
+          logger.debug(
+            """
+            upsertFromServerRecord: unknown record type
+                ℹ️ Creating metadata for unknown record type
+                Record: \(serverRecord.recordID.recordName)
+                Type: \(serverRecord.recordType)
+                Action: Storing metadata only (no local table)
+            """
+          )
+          
           try await userDatabase.write { db in
             try SyncMetadata.insert {
               SyncMetadata(
@@ -1536,9 +1847,14 @@
               let row = try T.find(#sql("\(bind: metadata.recordPrimaryKey)")).fetchOne(db)
               guard let row
               else {
-                reportIssue(
+                logger.warning(
                   """
-                  Local database record could not be found for '\(serverRecord.recordID.recordName)'.
+                  upsertFromServerRecord: missing local record
+                    ⚠️ Local database record not found
+                    Record: \(serverRecord.recordID.recordName)
+                    Table: \(T.databaseTableName)
+                    Primary key: \(metadata.recordPrimaryKey)
+                    Action: Skipping partial update, will perform full upsert
                   """
                 )
                 return columnNames
@@ -1573,6 +1889,17 @@
               else {
                 throw error
               }
+              
+              logger.debug(
+                """
+                [\(T.databaseTableName)] upsertFromServerRecord foreignKeyConstraint
+                  🔗 Foreign key constraint violation for: \(serverRecord.recordID.recordName)
+                  Table: \(T.databaseTableName)
+                  Primary key: \(serverRecord.recordID.recordPrimaryKey ?? "unknown")
+                  Action: Adding to unsynced records for retry after parent sync
+                """
+              )
+              
               try UnsyncedRecordID.insert(or: .ignore) {
                 UnsyncedRecordID(recordID: serverRecord.recordID)
               }
@@ -1647,7 +1974,16 @@
             if let asset = record[columnName] as? CKAsset {
               let data = try? asset.fileURL.map { try dataManager.wrappedValue.load($0) }
               if data == nil {
-                reportIssue("Asset data not found on disk")
+                logger.warning(
+                  """
+                  updateQuery: asset loading failed
+                    🛑 Asset data not found on disk
+                    Record: \(record.recordID.recordName)
+                    Column: \(columnName)
+                    File URL: \(asset.fileURL?.path ?? "nil")
+                    Action: Setting column to NULL
+                  """
+                )
               }
               return data?.queryFragment ?? "NULL"
             } else {
@@ -1663,7 +1999,16 @@
             if let asset = record[columnName] as? CKAsset {
               let data = try? asset.fileURL.map { try dataManager.wrappedValue.load($0) }
               if data == nil {
-                reportIssue("Asset data not found on disk")
+                logger.warning(
+                  """
+                  updateQuery: asset loading failed
+                    🛑 Asset data not found on disk
+                    Record: \(record.recordID.recordName)
+                    Column: \(columnName)
+                    File URL: \(asset.fileURL?.path ?? "nil")
+                    Action: Setting column to NULL
+                  """
+                )
               }
               return "\(quote: columnName) = \(data?.queryFragment ?? "NULL")"
             } else {
